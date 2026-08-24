@@ -34,6 +34,16 @@ export function checkCommand(command: string, confirm: boolean, config: AppConfi
     return { allowed: true };
   }
 
+  // PowerShell's backtick is its escape character and vanishes from the parsed
+  // command (e.g. "Rem`ove-Item" runs as "Remove-Item"), so it can split a
+  // keyword across the boundary a pattern like \bRemove-Item\b is looking for.
+  // Matching this backtick-stripped form too closes that specific evasion.
+  // This is not a complete defense - a regex blocklist cannot cover every way
+  // to spell a command in a Turing-complete shell language (string
+  // concatenation, char-code building, aliases beyond the ones already listed,
+  // etc.) - it raises the bar for the one concrete bypass found in review.
+  const normalized = command.replace(/`/g, '');
+
   for (const pattern of config.dangerousPatterns) {
     let re: RegExp;
     try {
@@ -41,7 +51,7 @@ export function checkCommand(command: string, confirm: boolean, config: AppConfi
     } catch {
       continue; // ignore a malformed pattern rather than crash the server
     }
-    if (re.test(command)) {
+    if (re.test(command) || re.test(normalized)) {
       return {
         allowed: false,
         reason:

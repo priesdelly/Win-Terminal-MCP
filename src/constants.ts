@@ -37,10 +37,5 @@ export const DEFAULT_CONFIG: AppConfig = {
   maxCommandLength: 4000,
   maxOutputChars: 25000,
   logCommands: true,
-  uia: {
-    windowClassName: 'CASCADIA_HOSTING_WINDOW_CLASS',
-    windowCreateTimeoutMs: 6000,
-    focusSettleMs: 150,
-  },
   daemonHostExe: 'powershell.exe',
 };

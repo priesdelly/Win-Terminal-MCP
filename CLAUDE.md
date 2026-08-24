@@ -2,9 +2,27 @@
 
 ## What this is
 
-An MCP (Model Context Protocol) server that lets an LLM drive the **real Windows Terminal application** (`wt.exe`) — not a throwaway shell. It opens actual tabs, types into them like a person would, reads back what's rendered on screen, and sends a real Ctrl+`<key>` scoped to one pane, using Windows UI Automation (the same mechanism screen readers use).
+An MCP (Model Context Protocol) server that lets an LLM drive a **real, persistent shell process** on Windows — not a throwaway shell. It starts a real `cmd.exe`/`pwsh.exe`/`powershell.exe` process attached to its own Windows pseudo console (ConPTY), types into it like a person would, reads back what it printed, and sends a real Ctrl+`<key>` scoped to one session, by writing the literal control byte into that session's own input pipe.
 
 It is a clean-room rewrite of `capecoma/winterm-mcp`, built to fix two problems in that project: it never actually controlled a persistent terminal (spawned a throwaway `cmd.exe` per call), and its Ctrl+C ran `taskkill /im node.exe /f`, killing every Node process on the machine.
+
+An earlier version of this project drove the real `wt.exe` GUI application via UI Automation and simulated keystrokes, so a human could watch commands run in a visible window. That approach was replaced (2026-08-24) after proving live on this machine that synthetic keystroke injection (`SendInput`/`keybd_event`) is unreliable when the system's active keyboard layout isn't English — see the "Current known status" section below for what was found and why ConPTY was chosen instead.
+
+## Working method
+
+Before starting any non-trivial change, search the web thoroughly first. Gather what you find, weigh it, and settle on one approach before writing code.
+
+A task is not done when the code is written. Test it against the actual expected result. Only report the task complete once that result is confirmed.
+
+## Security — mandatory, never skip
+
+These rules apply every time, without exception. Do not relax them under time pressure, a request to move faster, or user pushback.
+
+- **Source trust.** For any security-relevant code (input handling that reaches a shell, process spawning, session/identity checks, anything near `dangerousPatterns`), reference only official vendor documentation and official sample code (Microsoft Learn, the `microsoft/terminal` repo itself, etc.). Never port code, structure, or patterns from offensive-security tools (reverse shells, C2 frameworks, exploit PoCs) — even when the underlying OS primitives are identical and the intent here is defensive. Matching an offensive tool's code shape is itself a supply-chain and trust risk, independent of what the code does.
+- **Red team / blue team gate.** Any change that touches a security-relevant surface (`safety.ts`, text that reaches a shell, process spawning, session/identity handling, `dangerousPatterns`) must be reviewed by two separate agents before it counts as done — not one self-graded pass:
+  - Spawn a **red-team agent** whose only job is to attack the change: find a bypass, an injection point, a spoofing angle, a privilege escalation. It should assume nothing works until it fails to break it.
+  - Spawn a **blue-team agent** to independently verify, against the real running code (not a read-through), that what red team found is actually closed and nothing that worked before regressed.
+  Repeat until red team comes up empty. Write the result to `test-result/` (Thai + English, per the existing convention) the same way `QA-RedTeam-Report` already does.
 
 ## Architecture at a glance
 
@@ -19,15 +37,16 @@ src/index.ts ──registers──▶ 7 tools (list/open/write/read/send_control
       │  JSON-lines over child-process stdio (see src/daemonClient.ts)
       ▼
 helper/daemon.ps1   long-lived PowerShell process, one per MCP server instance
-      │  in-memory $script:Sessions: name -> {marker, shell, cwd, hwnd, createdAt}
+      │  in-memory $script:Sessions: name -> {shell, cwd, pid, createdAt, Session}
       ▼
-helper/WtControl.psm1   does the real work: UI Automation + Win32 keybd_event/SendKeys
-      │
+helper/PtySession.psm1   does the real work: Windows Pseudo Console (ConPTY) via
+      │                  CreatePseudoConsole/CreateProcess P/Invoke, background
+      │                  reader thread per session
       ▼
-wt.exe / Windows Terminal   real GUI window, real tabs
+cmd.exe / pwsh.exe / powershell.exe   real, persistent, headless child process
 ```
 
-Each "session" is one `wt.exe` tab, tagged at creation with a marker in its title (`MCP::<name>::<8-hex-suffix>`) so the daemon can re-find it on later calls without holding stale UI Automation references (Windows Terminal recreates parts of its UI tree on tab switches).
+Each "session" is one real child process attached to its own ConPTY, held alive in `$script:Sessions` for the daemon's whole lifetime — there is no window to lose track of and re-find, unlike the earlier UI-Automation-based design.
 
 ## Key files
 
@@ -36,15 +55,15 @@ Each "session" is one `wt.exe` tab, tagged at creation with a marker in its titl
 | `src/index.ts` | MCP server entrypoint. Registers all 7 tools, validates input with Zod, calls the daemon, writes audit-log entries. |
 | `src/daemonClient.ts` | Spawns and talks to the PowerShell daemon over JSON-lines stdio (`DaemonClient` class). One daemon per server process. |
 | `src/config.ts` | Loads optional `config.json` (gitignored) and deep-merges it over `DEFAULT_CONFIG`. |
-| `src/constants.ts` | `DEFAULT_CONFIG` — default shells, `dangerousPatterns` list, output/command limits, UIA timing settings. |
+| `src/constants.ts` | `DEFAULT_CONFIG` — default shells, `dangerousPatterns` list, output/command limits. |
 | `src/safety.ts` | `checkCommand()` — screens `write_to_terminal`'s `command` text against `dangerousPatterns`. Screens nothing else (not `name`, not `cwd`). |
 | `src/logger.ts` | Appends one JSON line per action to `logs/commands.log`, rotates at 5MB. |
 | `src/types.ts` | Shared TypeScript interfaces: `AppConfig`, `SessionInfo`/`SessionSummary`, `DaemonRequest`/`DaemonResponse`. |
 | `helper/daemon.ps1` | Long-lived PowerShell process. Reads JSON-lines from stdin, dispatches to `Invoke-Action`, writes JSON-lines to stdout. Owns `$script:Sessions`. |
-| `helper/WtControl.psm1` | All UI Automation + Win32 logic: open a tab, re-find it, read its text, send keystrokes/Ctrl+`<key>`, close it. |
+| `helper/PtySession.psm1` | All ConPTY/Win32 logic: create a pseudo console, spawn the shell attached to it, write input, read captured output, send Ctrl+`<key>`, terminate it. The P/Invoke signatures and pseudo-console lifecycle are ported from Microsoft's own official sample (`microsoft/terminal/samples/ConPTY/MiniTerm`) — see the Security policy above. |
 | `config.example.json` | Template for a local `config.json` (safety patterns, shells, limits, `readOnlyMode`). |
-| `test-result/` | QA + Red Team audit findings and tested fixes — **read before assuming this tool works** (see below). |
-| `test-case/` | End-to-end test cases for this project. |
+| `test-result/` | Referenced by the status note below but **does not currently exist in this repo** — treat any mention of it as aspirational until it's created. |
+| `test-case/` | Same as above — referenced but not present on disk. |
 
 ## Documentation language
 
@@ -52,7 +71,7 @@ Every document under `test-result/` and `test-case/` (and any similar report/tes
 
 ## Tools exposed
 
-`list_terminal_sessions`, `open_terminal_session`, `write_to_terminal`, `read_terminal_output`, `send_control_character`, `close_terminal_session`, `debug_inspect_windows`. Full schemas and descriptions live in `src/index.ts`.
+`list_terminal_sessions`, `open_terminal_session`, `write_to_terminal`, `read_terminal_output`, `send_control_character`, `close_terminal_session`, `debug_inspect_sessions`. Full schemas and descriptions live in `src/index.ts`.
 
 Writing to session name `"default"` auto-creates it with the configured default shell — `open_terminal_session` only needs to be called explicitly for a second, independently-named session or a non-default shell/cwd.
 
@@ -61,7 +80,7 @@ Writing to session name `"default"` auto-creates it with the configured default 
 - `dangerousPatterns`: regex blocklist checked against `write_to_terminal`'s `command` text only. A match blocks unless the call is resent with `confirm: true`.
 - `readOnlyMode`: disables `write_to_terminal` entirely when `true` in `config.json`.
 - Audit log: every write/interrupt/open/close appended to `logs/commands.log` (plain JSON lines).
-- Ctrl+`<key>` is a real, focused keystroke sent only to the pane in focus at send time — not a machine-wide kill signal.
+- Ctrl+`<key>` is the literal control byte written directly into one session's own ConPTY input pipe — not a machine-wide kill signal, and not a keystroke that could land on an unrelated window.
 
 ## Build & dev
 
@@ -81,17 +100,31 @@ pwsh -NoProfile -Command '[System.Management.Automation.Language.Parser]::ParseF
 
 ## Current known status — read this before assuming the tool works
 
-A QA + Red Team pass (2026-08-23) found that the server did not function at all with the default config, plus one Critical, live-confirmed security bug. Full root-cause analysis, evidence, and the original tested fixes are written up in `test-result/QA-RedTeam-Report-EN.md` (English, detailed) and `test-result/QA-RedTeam-Report.md` (Thai original) — read that report for background before touching `daemon.ps1`/`WtControl.psm1`/`safety.ts` again.
+**2026-08-24: the terminal-control approach was rewritten from UI Automation to ConPTY.** A user testing the previous (UI-Automation + simulated-keystroke) version through Claude Desktop reported that typed text wasn't landing on the real `wt.exe` window at all. Investigating on this machine found two real, distinct bugs, both fixed in that architecture at the time:
 
-As of this check (2026-08-23), **all 8 of the report's findings are fixed in the code**:
+1. A race between `SendInput`'s asynchronous key delivery and a `Restore-ForegroundWindow` call that stole focus back immediately afterward, before Windows Terminal's message loop had dispatched the queued keystrokes.
+2. More fundamentally: `SendInput`+`KEYEVENTF_UNICODE` does not reliably bypass the active keyboard layout on this machine. This machine's fresh-window default input layout is Thai (`0x041E`, confirmed via `GetKeyboardLayout`), and typed ASCII text came out corrupted (verified with a live Notepad test) regardless of the Unicode-packet approach.
 
-1. **Fixed** — `helper/daemon.ps1` no longer computes `$ModulePath`'s default from `$PSScriptRoot` inside `param()`; it resolves the path in the script body instead, after the `param()` block finishes.
-2. **Fixed** — `open_session` in `daemon.ps1` reads `$Params.timeoutMs` / `$Params.cwd` through `PSObject.Properties[...]` existence checks, so it no longer throws under `Set-StrictMode -Version Latest` when Node omits those keys.
-3. **Fixed, both layers** — `Open-WtSession` in `WtControl.psm1` builds its command line through `Format-ArgumentForCommandLine` and starts `wt.exe` via `ProcessStartInfo` instead of unquoted `Start-Process -ArgumentList` (Layer 1). `src/index.ts`'s `name` schema is also now restricted to `^[A-Za-z0-9_-]+$` (Layer 2).
-4. **Fixed** — `Bring-WtWindowToForeground` checks `SetForegroundWindow`'s return value and throws if it's `false`, then re-verifies with `GetForegroundWindow()` before returning, instead of sending keystrokes on unconfirmed focus.
-5. **Fixed** — the `dangerousPatterns` regexes now compile with the `s` (dotAll) flag, and the pattern list adds alias coverage (`rm`/`ri`/`del`/`erase`) plus a reversed-argument-order variant, closing all three bypasses the report demonstrated.
-6. **Fixed** — `Import-Module` in `daemon.ps1` now passes `-WarningAction SilentlyContinue`, so the unapproved-verb warning no longer leaks onto stdout and risks corrupting the JSON-lines protocol.
-7. **Fixed** — the report's suggested signal (tab `ProcessId`) turned out not to work: it identifies `WindowsTerminal.exe` itself, which is identical for every tab in one window, so it can't disambiguate a spoofed tab from the real one in the (default, `newWindow:false`) common case. Fixed instead with the UIA `RuntimeId` captured for each tab at session-creation time (`Open-WtSession`, `WtControl.psm1`) and threaded through every re-lookup (`Find-WtTabByMarker`'s new `-ExpectedRuntimeId` param, stored per-session in `daemon.ps1`'s `$script:Sessions` and passed by every dispatch branch). When more than one tab shares a marker title, only the one whose RuntimeId matches is trusted; otherwise the daemon throws instead of guessing.
-8. **Fixed** — the auto-create-`"default"`-session path inside `write_to_terminal` (`src/index.ts`) now calls `auditLog(...)` right after the session opens, matching the explicit `open_terminal_session` path.
+Rather than keep fighting the OS input stack (focus-stealing, IME/layout dependence, no reliable way to guarantee delivery), the whole keystroke-injection design was replaced with ConPTY (`helper/PtySession.psm1`, ported from Microsoft's official `microsoft/terminal/samples/ConPTY/MiniTerm` sample — see the Security policy above for why only that source was used). This trades away the "watch it happen in a real visible `wt.exe` window" feature for a fundamentally more reliable transport: text is written as raw bytes into the child process's own input pipe, with no keyboard, focus, or window involved at all.
 
-**Verification status:** #1-#8 were confirmed by driving the real `daemon.ps1` protocol directly over stdin/stdout against a real `wt.exe`/`WindowsTerminal.exe` on this machine (open → write → read → close, with real keystrokes and real UI Automation) — including a live PoC for #7 that opened a second tab in the same window retitled to match an active session's exact marker, and confirmed the daemon kept reading/writing the real tab, never the spoofed one. What is still **not** verified: an actual MCP round-trip through Node. This machine still has no Node.js/npm installed, so `npm run build` and a real client → `dist/index.js` → daemon path have never been executed (`test-case/basic-session-e2e-EN.md` is written for exactly this and has not been run yet). Treat the fixes as "verified at the daemon/PowerShell layer" — not as "verified through the actual MCP tool interface" — until that case is run on a machine with Node.
+**A second real bug was found and fixed during the ConPTY port itself**, worth recording because it is not obvious from the official sample: when the *calling* process's own stdio is redirected/piped (true for a daemon with no real console of its own — confirmed live on this machine, including with a from-scratch `dotnet run` reproduction outside PowerShell entirely, to rule out a PowerShell-hosting artifact), Windows duplicates those redirected handles into the ConPTY-attached child regardless of `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`, so the child's output leaks to wherever the parent's redirected stdout points instead of the pseudo console. The fix (confirmed by a `microsoft/terminal` maintainer, https://github.com/microsoft/terminal/discussions/15814) is `STARTF_USESTDHANDLES` set on the child's `STARTUPINFOEX.dwFlags`, with the std handles themselves left null — see the comment at that exact line in `PtySession.psm1`.
+
+**Verification status:** this pass went further than any previous one — it includes a real, full MCP round-trip. Node.js/npm are now installed on this machine (`npm install && npm run build` succeeds with no TypeScript errors), and a real `@modelcontextprotocol/sdk` `Client` was driven against the actual built `dist/index.js` over real stdio: `tools/list`, `open_terminal_session`, `write_to_terminal`, `read_terminal_output`, `send_control_character`, `list_terminal_sessions`, `debug_inspect_sessions`, `close_terminal_session`, and the `dangerousPatterns` block-then-`confirm:true` flow all worked correctly end to end, including a session-persistence check (`cd`-equivalent state, i.e. one `whoami`/`echo` pair in the same session sharing history) and a check that ASCII text written into the pty comes back uncorrupted (the Thai-layout bug from the old approach does not reproduce here, since no keyboard layout is involved at all).
+
+**Known non-issue, in case it resurfaces:** during this same testing, external `.exe` commands (`whoami`, `where`) inside a session failed with "not recognized" while cmd.exe builtins (`echo`) worked fine. Traced to `%PATHEXT%` being truncated to just `.CPL` in this specific sandboxed dev environment's own process environment (confirmed via `echo %PATHEXT%` inside a live session, and confirmed the full path / explicit `.exe` extension both work) — not a bug in `PtySession.psm1`. A normal Windows environment (and Claude Desktop's own process environment) will not have this problem.
+
+**Red-team/blue-team review was run for this change** (per the Security policy above) and found real, live-confirmed issues, all now fixed and independently re-verified except two left deliberately open:
+
+- **Fixed** — `open_terminal_session`'s `cwd` reached `CreateProcess`'s `lpCurrentDirectory` with no validation. A UNC path caused real SMB negotiation (forced-authentication risk) and blocked the daemon's single-threaded synchronous dispatch loop for ~21s against an unreachable host - a DoS against every other open session from one call. `New-PtySession` (`PtySession.psm1`) now rejects any `cwd` starting with `\\`/`//` and requires the path to exist locally, before ever calling `CreateProcess`. Verified: UNC input now throws in single-digit ms instead of ~21s; a local directory *symlink* pointing at a UNC target does slip past this check (flagged, not fixed - it needs local shell access to create first, at which point `cd \\host\share` directly is no new capability).
+- **Fixed** — `dangerousPatterns` in `src/safety.ts` was trivially bypassed with a PowerShell backtick (`` Rem`ove-Item `` parses and runs as `Remove-Item` but doesn't match the pattern). `checkCommand()` now also matches a backtick-stripped copy of the command. This is a narrow, targeted fix for the one demonstrated bypass, not a claim of completeness - a regex blocklist cannot cover every way to spell a command in a Turing-complete shell.
+- **Fixed** — splitting a dangerous command across two `write_to_terminal` calls (`pressEnter:false` then the rest) defeated the single-call check, since each half looks safe alone. `src/index.ts` now tracks each session's not-yet-submitted line (`pendingLine`) and checks the full accumulated text on every call, clearing it when the line is actually submitted or the shell's line is otherwise reset (Ctrl+`<key>`, session open/close).
+- **Fixed** — `daemon.ps1` used unguarded `$Params.pressEnter`/`$Params.lines`/`$Params.shellArgs` access, which throws under `Set-StrictMode` if a caller omits the key (not reachable through the shipped Zod schemas today, but latent). All three now check `$Params.PSObject.Properties[...]` first, matching the pattern the `cwd`/`timeoutMs` fix from the old UI-Automation era used.
+- **Fixed, incidentally** — `CreateProcess`'s P/Invoke declaration in `PtySession.psm1` was missing `SetLastError = true` (unlike every other kernel32 import in the file), which produced misleading `GetLastWin32Error()` values after a real failure. Added.
+
+**Discovered while fixing the above, left open, real UX limitation:** the fix for the split-command bypass initially tried to auto-clear the stuck unsent fragment with Ctrl+C when a block occurred. That doesn't work reliably: sending Ctrl+C over this ConPTY transport only delivers conhost's `CTRL_C_EVENT` *signal* (which does nothing to an idle prompt - confirmed, matches expected behavior), not the distinct "Ctrl+C as a keypress" that PSReadLine's own key-binding needs to cancel an in-progress, not-yet-submitted line - so the stuck fragment stays put, and on top of that, sending it measurably injects a stray character (`U+0E41`, a Thai letter - the same Thai-locale quirk from the keystroke-injection era, this time inside conhost's own VT redraw, not our code) into the session's output. The auto-clear was removed; `write_to_terminal`'s blocked-response now tells the caller there is no reliable way to clear just that line and to close/reopen the session instead. `send_control_character`'s tool description was updated to say the same thing plainly.
+
+**Verification status:** this pass went further than any previous one — it includes a real, full MCP round-trip. Node.js/npm are now installed on this machine (`npm install && npm run build` succeeds with no TypeScript errors), and a real `@modelcontextprotocol/sdk` `Client` was driven against the actual built `dist/index.js` over real stdio: `tools/list`, `open_terminal_session`, `write_to_terminal`, `read_terminal_output`, `send_control_character`, `list_terminal_sessions`, `debug_inspect_sessions`, `close_terminal_session`, the `dangerousPatterns` block-then-`confirm:true` flow, and all five red-team/blue-team fixes above were verified through this same real client-to-built-server path (not just at the PowerShell layer) — including a session-persistence check (`cd`-equivalent state, i.e. one `whoami`/`echo` pair in the same session sharing history) and a check that ASCII text written into the pty comes back uncorrupted (the Thai-layout bug from the old keystroke-injection approach does not reproduce for typed text here, since no keyboard layout is involved in that path at all - only the separate Ctrl+C-echo quirk noted above does).
+
+**Known non-issue, in case it resurfaces:** during this same testing, external `.exe` commands (`whoami`, `where`) inside a session failed with "not recognized" while cmd.exe builtins (`echo`) worked fine. Traced to `%PATHEXT%` being truncated to just `.CPL` in this specific sandboxed dev environment's own process environment (confirmed via `echo %PATHEXT%` inside a live session, and confirmed the full path / explicit `.exe` extension both work) — not a bug in `PtySession.psm1`. A normal Windows environment (and Claude Desktop's own process environment) will not have this problem.
+
+**Not yet done:** `test-result/` and `test-case/` are referenced elsewhere in this file but do not exist in the repo — this session's red-team/blue-team findings above have not been written up there (Thai + English) per the existing convention.

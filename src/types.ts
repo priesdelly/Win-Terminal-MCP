@@ -12,21 +12,15 @@ export interface AppConfig {
   maxCommandLength: number;
   maxOutputChars: number;
   logCommands: boolean;
-  uia: {
-    windowClassName: string;
-    windowCreateTimeoutMs: number;
-    focusSettleMs: number;
-  };
   daemonHostExe: string;
 }
 
 export interface SessionInfo {
   [key: string]: unknown;
   name: string;
-  marker: string;
   shell: string;
   cwd?: string;
-  hwnd: number;
+  pid: number;
   createdAt: string;
 }
 

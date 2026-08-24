@@ -82,9 +82,7 @@ export class DaemonClient {
           : '';
         throw new Error(
           `Windows Terminal MCP daemon did not respond to ping (host: ${this.daemonHostExe}). ` +
-            `This process only works on Windows with Windows Terminal (wt.exe) installed.${extra}\n${
-              (err as Error).message
-            }`,
+            `This process only works on Windows.${extra}\n${(err as Error).message}`,
         );
       }
     })();

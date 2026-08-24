@@ -1,7 +1,7 @@
 {
   "name": "winterminal-mcp-server",
   "version": "0.1.0",
-  "description": "MCP server that drives the real Windows Terminal application (wt.exe) via UI Automation — open tabs, type commands, read what's on screen, and send real Ctrl+C, scoped to a single pane instead of the whole machine.",
+  "description": "MCP server that drives a real, persistent shell process via the Windows Pseudo Console API (ConPTY) — type commands, read output, and send real Ctrl+C, scoped to a single session instead of the whole machine.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

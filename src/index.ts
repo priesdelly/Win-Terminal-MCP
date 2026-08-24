@@ -2,10 +2,11 @@
 /**
  * winterminal-mcp-server
  *
- * An MCP server that drives the real Windows Terminal application (wt.exe)
- * through UI Automation: it opens actual tabs you can watch, types into them
- * exactly like a human at the keyboard, reads back what's rendered on screen,
- * and can send a real Ctrl+<key> chord scoped to whichever pane is focused.
+ * An MCP server that drives a real, persistent shell process (cmd.exe/pwsh.exe/
+ * powershell.exe) through the Windows Pseudo Console API (ConPTY): it writes
+ * bytes to the shell's input exactly like a terminal would, reads its output
+ * back, and can send a real Ctrl+<key> control byte straight into that one
+ * session's own input pipe.
  *
  * This is a clean-room implementation. It was written after reviewing (but
  * copying no code from) https://github.com/capecoma/winterm-mcp, to fix two
@@ -15,8 +16,10 @@
  * `taskkill /im node.exe /f`, which kills every node.exe process on the
  * whole machine, not just the one command it meant to interrupt.
  *
- * Here, Ctrl+<key> is a real simulated keystroke sent only to the terminal
- * pane that is currently focused - it can never reach an unrelated process.
+ * Here, each session is one real, persistent child process attached to its
+ * own pseudo console, and Ctrl+<key> is the literal control byte written into
+ * that one session's own input pipe - it physically cannot reach any other
+ * process, since there is no keyboard/focus involved at all.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -31,6 +34,18 @@ import type { SessionInfo, SessionSummary } from './types.js';
 
 const config = loadConfig();
 const daemon = new DaemonClient(config.daemonHostExe);
+
+/**
+ * Text sent to a session with pressEnter:false sits at the shell's prompt,
+ * unexecuted, until a later call presses Enter. checkCommand() only ever sees
+ * one call's text, so splitting a dangerous command across two calls (each
+ * half individually harmless-looking) would defeat it. This tracks each
+ * session's not-yet-submitted line so every check runs against the full
+ * accumulated line, not just the latest fragment. Cleared whenever the line
+ * is actually submitted (pressEnter:true) or the shell's current line is
+ * otherwise reset (Ctrl+<key>, session open/close).
+ */
+const pendingLine = new Map<string, string>();
 
 function textResult(text: string) {
   return { content: [{ type: 'text' as const, text }] };
@@ -85,12 +100,12 @@ const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 server.registerTool(
   'list_terminal_sessions',
   {
-    title: 'List Windows Terminal Sessions',
-    description: `Lists every session this server currently knows about, each backed by a real, visible Windows Terminal (wt.exe) tab.
+    title: 'List Terminal Sessions',
+    description: `Lists every session this server currently knows about, each backed by a real, persistent shell process attached to its own pseudo console.
 
-Returns for each session: name, shell (pwsh/powershell/cmd), starting directory, creation time, and whether the tab is still alive (false if the user closed it by hand since it was opened).
+Returns for each session: name, shell (pwsh/powershell/cmd), starting directory, creation time, and whether the process is still alive (false if it exited or was killed since it was opened).
 
-Use this before write_to_terminal/read_terminal_output when you're not sure which named sessions already exist, or to check whether a session the user closed needs to be reopened.`,
+Use this before write_to_terminal/read_terminal_output when you're not sure which named sessions already exist, or to check whether a session that exited needs to be reopened.`,
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -100,7 +115,7 @@ Use this before write_to_terminal/read_terminal_output when you're not sure whic
       return textResult('No terminal sessions are open yet. Call open_terminal_session, or just call write_to_terminal and a "default" session will be created automatically.');
     }
     const lines = sessions.map(
-      (s) => `- ${s.name} (${s.shell}${s.cwd ? `, cwd: ${s.cwd}` : ''}) - ${s.alive ? 'open' : 'CLOSED (tab was closed by hand)'}`,
+      (s) => `- ${s.name} (${s.shell}${s.cwd ? `, cwd: ${s.cwd}` : ''}) - ${s.alive ? 'open' : 'CLOSED (process exited)'}`,
     );
     return { ...textResult(lines.join('\n')), structuredContent: { sessions } };
   },
@@ -115,23 +130,21 @@ const OpenSessionSchema = z
     shell: z
       .enum(['pwsh', 'powershell', 'cmd'])
       .default('pwsh')
-      .describe('Which shell to start in the new tab. "pwsh" is PowerShell 7+, "powershell" is the Windows-builtin 5.1, "cmd" is classic cmd.exe.'),
-    cwd: z.string().optional().describe('Starting directory for the new tab, e.g. "C:\\\\src\\\\myproject". Defaults to the user\'s home/profile directory.'),
-    newWindow: z.boolean().default(false).describe('true = open a brand-new Windows Terminal window; false (default) = add a tab to the most recently focused Windows Terminal window (or create one if none is open).'),
+      .describe('Which shell to start. "pwsh" is PowerShell 7+, "powershell" is the Windows-builtin 5.1, "cmd" is classic cmd.exe.'),
+    cwd: z.string().optional().describe('Starting directory for the session, e.g. "C:\\\\src\\\\myproject". Defaults to the user\'s home/profile directory.'),
   })
   .strict();
 
 server.registerTool(
   'open_terminal_session',
   {
-    title: 'Open Windows Terminal Session',
-    description: `Opens a new tab in the real Windows Terminal application and registers it under a name you choose.
+    title: 'Open Terminal Session',
+    description: `Starts a new, persistent shell process attached to its own pseudo console, and registers it under a name you choose.
 
 Args:
   - name (string): unique session name, defaults to "default"
   - shell ('pwsh' | 'powershell' | 'cmd'): defaults to 'pwsh'. Falls back to 'powershell' automatically (with a warning in the result) if pwsh.exe is not installed.
   - cwd (string, optional): starting directory
-  - newWindow (boolean): open a fresh Windows Terminal window instead of a tab in the existing one (default false)
 
 You do not need to call this before write_to_terminal - writing to the "default" session name auto-creates it. Use this tool explicitly when you want a second, independently named session (e.g. run a dev server in "server" while running git commands in "git"), or want to pick the shell/starting directory yourself.
 
@@ -147,13 +160,13 @@ Errors if a session with that name is already open - close it first or pick a di
       shellExe: exe,
       shellArgs: args,
       cwd: params.cwd,
-      newWindow: params.newWindow,
     });
+    pendingLine.delete(params.name);
     auditLog(
       { ts: new Date().toISOString(), session: params.name, action: 'open_terminal_session', detail: `${exe} ${args.join(' ')}` },
       config.logCommands,
     );
-    return { ...textResult(`${warning}Opened session "${params.name}" (${exe}) in a real Windows Terminal tab.`), structuredContent: info };
+    return { ...textResult(`${warning}Opened session "${params.name}" (${exe}), pid ${info.pid}.`), structuredContent: info };
   },
 );
 
@@ -183,7 +196,7 @@ server.registerTool(
   'write_to_terminal',
   {
     title: 'Write To Terminal',
-    description: `Types a command or text into a real, visible Windows Terminal tab, exactly as if a person typed it, then presses Enter (by default).
+    description: `Writes a command or text into a session's shell input, exactly as if a person typed it, then presses Enter (by default).
 
 Args:
   - session (string): which session to write to (default "default"; auto-created if it doesn't exist yet, using the default shell)
@@ -201,8 +214,31 @@ Errors:
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   },
   async (params: z.infer<typeof WriteSchema>) => {
-    const check = checkCommand(params.command, params.confirm, config);
+    // Check against the full accumulated line (any earlier pressEnter:false
+    // fragments plus this one), not just this call's text - see pendingLine.
+    const hadPendingFragment = pendingLine.has(params.session);
+    const accumulated = (pendingLine.get(params.session) ?? '') + params.command;
+    const check = checkCommand(accumulated, params.confirm, config);
     if (!check.allowed) {
+      // An earlier pressEnter:false fragment (already sent to the real prompt,
+      // since it looked safe alone) is what makes accumulated dangerous here.
+      // That fragment is still sitting unexecuted at the shell's prompt, and
+      // there is no reliable way from here to clear it: Ctrl+C only delivers
+      // conhost's CTRL_C_EVENT signal (which does nothing to an idle prompt),
+      // not the distinct "Ctrl+C as a keypress" PSReadLine needs to cancel an
+      // in-progress edit, so it does not reliably clear the line (confirmed on
+      // this machine) - and on top of that, sending it measurably injects a
+      // stray character into the shell's own redraw output. Writing anything
+      // more would land on the same unexecuted line. The only reliable way to
+      // get this session back to a clean prompt is to close and reopen it.
+      let stuckWarning = '';
+      if (hadPendingFragment) {
+        stuckWarning =
+          ' An earlier unsent fragment is still sitting at this session\'s prompt, unexecuted, and there is no reliable ' +
+          'way to clear just that line - call close_terminal_session and open_terminal_session to get a fresh prompt ' +
+          'before writing anything else to this session.';
+        pendingLine.delete(params.session);
+      }
       auditLog(
         {
           ts: new Date().toISOString(),
@@ -214,7 +250,12 @@ Errors:
         },
         config.logCommands,
       );
-      return textResult(`Blocked: ${check.reason}`);
+      return textResult(`Blocked: ${check.reason}${stuckWarning}`);
+    }
+    if (params.pressEnter) {
+      pendingLine.delete(params.session);
+    } else {
+      pendingLine.set(params.session, accumulated);
     }
 
     let autoCreateWarning = '';
@@ -222,7 +263,7 @@ Errors:
       const { exe, args, warning } = await resolveShellWithFallback(config.defaultShell);
       autoCreateWarning = warning;
       try {
-        await daemon.call<SessionInfo>('open_session', { name: DEFAULT_SESSION_NAME, shellExe: exe, shellArgs: args, newWindow: false });
+        await daemon.call<SessionInfo>('open_session', { name: DEFAULT_SESSION_NAME, shellExe: exe, shellArgs: args });
         auditLog(
           { ts: new Date().toISOString(), session: DEFAULT_SESSION_NAME, action: 'open_terminal_session', detail: `${exe} ${args.join(' ')}` },
           config.logCommands,
@@ -230,7 +271,8 @@ Errors:
       } catch (err) {
         // Another concurrent write_to_terminal call may have won the race to
         // create the "default" session between our check and this call - that's
-        // fine, proceed to write. Any other failure (e.g. wt.exe missing) is real.
+        // fine, proceed to write. Any other failure (e.g. the configured shell
+        // exe missing) is real.
         if (!/already open/i.test((err as Error).message)) throw err;
       }
     }
@@ -264,16 +306,16 @@ server.registerTool(
   'read_terminal_output',
   {
     title: 'Read Terminal Output',
-    description: `Reads the text currently visible in a Windows Terminal session, via UI Automation's Text pattern (the same mechanism screen readers use) - not a synthetic log, but what is actually rendered on screen right now.
+    description: `Reads a session's captured output transcript: everything the shell has printed since the session opened, with terminal escape/color codes stripped and carriage-return line-rewrites (progress bars, spinners) collapsed to their final state.
 
 Args:
   - session (string): which session to read (default "default")
-  - lines (number): trailing lines to return, 0 = everything visible (default 0)
-  - waitForIdleMs / timeoutMs: optionally wait for output to stop changing (a heuristic for "the command probably finished") before returning; without this the call returns immediately with whatever is on screen right now
+  - lines (number): trailing lines to return, 0 = everything captured so far (default 0)
+  - waitForIdleMs / timeoutMs: optionally wait for output to stop changing (a heuristic for "the command probably finished") before returning; without this the call returns immediately with whatever has been captured so far
 
 Returns: { text, truncated, idleReached, timedOut }. Long output is truncated from the start (oldest lines dropped first) to maxOutputChars (see config.json); truncated is true when that happened.
 
-Note: this reflects the terminal's current viewport/scrollback as UIA exposes it, not the full unlimited history of everything ever printed.`,
+Note: this is a plain-text transcript, not a full terminal screen emulation - a full-screen app (vim, htop) that repaints the same screen region repeatedly will show as a scrolling log of each repaint, not one clean frame.`,
     inputSchema: ReadSchema.shape,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -316,7 +358,7 @@ Note: this reflects the terminal's current viewport/scrollback as UIA exposes it
 const ControlCharSchema = z
   .object({
     session: z.string().min(1).max(64).default(DEFAULT_SESSION_NAME).describe('Session to send the key to.'),
-    key: z.string().min(1).max(6).default('C').describe('Letter/digit for Ctrl+<key> (e.g. "C" for Ctrl+C, "Z" for Ctrl+Z), or "BREAK" for Ctrl+Break.'),
+    key: z.string().min(1).max(6).default('C').describe('Letter for Ctrl+<key> (e.g. "C" for Ctrl+C to interrupt, "Z" for Ctrl+Z / EOF).'),
   })
   .strict();
 
@@ -324,18 +366,23 @@ server.registerTool(
   'send_control_character',
   {
     title: 'Send Control Character',
-    description: `Sends a real Ctrl+<key> keystroke (e.g. Ctrl+C to interrupt) to a Windows Terminal session.
+    description: `Sends a real Ctrl+<key> control byte (e.g. Ctrl+C to interrupt) directly into a session's own shell input.
 
-This is a genuine simulated keypress sent only to the specific pane after focusing it - it lands exactly like a person pressing Ctrl+C at that terminal, and cannot affect any other window or process on the machine.
+This writes the literal ASCII control byte straight into this one session's input pipe - it physically cannot reach any other process on the machine, since there is no keyboard/focus involved at all.
 
 Args:
   - session (string): which session (default "default")
-  - key (string): "C" (default), any other letter/digit for Ctrl+<that key>, or "BREAK" for Ctrl+Break`,
+  - key (string): "C" (default) or any other letter for Ctrl+<that key>
+
+Ctrl+Break is not supported - there is no ASCII control byte for it over this transport. Use "C" to interrupt a running command.
+
+Reliably interrupts a command that is actually running. It is not a reliable way to cancel text already typed into the prompt but not yet submitted (pressEnter:false) - PowerShell's line editor needs Ctrl+C delivered as its own keypress to cancel an in-progress edit, which this transport does not guarantee. To discard an unsent fragment, close and reopen the session instead.`,
     inputSchema: ControlCharSchema.shape,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   async (params: z.infer<typeof ControlCharSchema>) => {
     await daemon.call('send_control_character', { name: params.session, key: params.key });
+    pendingLine.delete(params.session);
     auditLog(
       { ts: new Date().toISOString(), session: params.session, action: 'send_control_character', detail: `Ctrl+${params.key.toUpperCase()}` },
       config.logCommands,
@@ -357,7 +404,7 @@ server.registerTool(
   'close_terminal_session',
   {
     title: 'Close Terminal Session',
-    description: `Closes a session's Windows Terminal tab (Ctrl+Shift+W on the focused pane; closes the whole window if it was the last tab in it) and forgets it.
+    description: `Terminates a session's shell process and forgets it.
 
 Args:
   - session (string): session name to close
@@ -368,6 +415,7 @@ Errors with "No open session named ..." if it's already gone.`,
   },
   async (params: z.infer<typeof CloseSchema>) => {
     await daemon.call('close_session', { name: params.session });
+    pendingLine.delete(params.session);
     auditLog(
       { ts: new Date().toISOString(), session: params.session, action: 'close_terminal_session', detail: '' },
       config.logCommands,
@@ -377,20 +425,20 @@ Errors with "No open session named ..." if it's already gone.`,
 );
 
 // ---------------------------------------------------------------------------
-// debug_inspect_windows
+// debug_inspect_sessions
 // ---------------------------------------------------------------------------
 server.registerTool(
-  'debug_inspect_windows',
+  'debug_inspect_sessions',
   {
-    title: 'Debug Inspect Windows Terminal UIA Tree',
-    description: `Diagnostic tool: dumps everything UI Automation can currently see across all open Windows Terminal windows - window handles, tab titles, and every element that supports text reading, with its bounding box.
+    title: 'Debug Inspect Sessions',
+    description: `Diagnostic tool: dumps the daemon's internal state for every session it knows about - pid, alive status, and how many characters of output are currently buffered.
 
-Use this when a session seems "stuck" (write/read errors, session not found) to see whether Windows Terminal's accessibility tree looks as expected on this machine. Not needed for normal use.`,
+Use this when a session seems "stuck" (write/read errors, session not found) to see what the daemon actually has in memory. Not needed for normal use.`,
     inputSchema: {},
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   async () => {
-    const snapshot = await daemon.call('debug_inspect_windows', {});
+    const snapshot = await daemon.call('debug_inspect_sessions', {});
     return { ...textResult(JSON.stringify(snapshot, null, 2)), structuredContent: snapshot as Record<string, unknown> };
   },
 );
@@ -401,7 +449,7 @@ Use this when a session seems "stuck" (write/read errors, session not found) to 
 async function main() {
   if (process.platform !== 'win32') {
     console.error(
-      'WARNING: this server drives the Windows Terminal application via UI Automation and only functions on Windows. ' +
+      'WARNING: this server drives shell processes via the Windows Pseudo Console API (ConPTY) and only functions on Windows. ' +
         `Detected platform: ${process.platform}.`,
     );
   }
