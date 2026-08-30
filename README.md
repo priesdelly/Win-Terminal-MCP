@@ -36,7 +36,7 @@ npm install
 npm run build
 ```
 
-Optionally copy `config.example.json` to `config.json` and adjust (default shell, safety patterns, output limits — see comments inside). `config.json` is gitignored so your local tweaks never get committed.
+Optionally copy `config.example.json` to `config.json` and adjust (default shell, safety patterns, output limits). `config.json` is gitignored so your local tweaks never get committed.
 
 ## Configure Claude Desktop
 
@@ -75,7 +75,7 @@ You don't have to call `open_terminal_session` first — writing to the session 
 
 ## Safety
 
-- **Dangerous-command screening**: `write_to_terminal` checks the command text against `dangerousPatterns` in `config.json` (things like `Remove-Item -Recurse`, `Format-Volume`, `shutdown`, registry deletes, a fork bomb pattern, ...). A match is blocked with an explanation; resend with `confirm: true` to proceed anyway. Edit the pattern list to taste.
+- **Dangerous-command screening**: `write_to_terminal` checks the command text against `dangerousPatterns` in `config.json` (things like `Remove-Item -Recurse`, `Format-Volume`, `shutdown`, registry deletes, a fork bomb pattern, ...). A match is blocked with an explanation; resend with `confirm: true` to proceed anyway. Edit the pattern list to taste. A single command is also capped at `maxCommandLength` (4000 characters by default).
 - **`readOnlyMode`**: set `true` in `config.json` to disable `write_to_terminal` entirely (reading and Ctrl+C still work).
 - **Scoped interrupts**: Ctrl+`<key>` is a control byte written directly into one session's own input pipe — it cannot affect any other process, window, or session. See "Why this exists" above.
 - **Audit log**: every write/interrupt/open/close is appended to `logs/commands.log` (plain JSON lines, one per action, rotated at 5MB) so you can always see exactly what was typed into your terminal and when. Delete the file any time; it just gets recreated.
@@ -85,7 +85,8 @@ You don't have to call `open_terminal_session` first — writing to the session 
 
 - **Not a full terminal screen emulation.** `read_terminal_output` strips VT/ANSI escape codes and collapses carriage-return line-rewrites (progress bars, spinners) to their final state, but it does not track cursor position or repaint state. A full-screen app (vim, htop) that redraws the same screen region repeatedly will show up as a scrolling log of each repaint, not one clean frame.
 - **`read_terminal_output` is a growing transcript**, capped at 4MB of captured output per session (oldest bytes dropped first) — not an unlimited history, and not scoped to "what's currently visible" the way a real terminal window is.
-- **No visible window.** Sessions run headless via ConPTY — there is nothing to look at on screen. If you want to literally watch commands run in a visible Windows Terminal window, this project intentionally does not do that (an earlier version of this project drove the real `wt.exe` GUI via UI Automation and simulated keystrokes; it was replaced because keystroke injection turned out to be unreliable — see git history for that approach if you need it as a reference).
+- **No visible window.** Sessions run headless via ConPTY. An earlier version drove the real `wt.exe` GUI via simulated keystrokes so a human could watch; it was replaced because keystroke injection turned out to be unreliable (see git history if you need that approach as a reference).
+- **Ctrl+C cannot cancel an unsent line.** `send_control_character` reliably interrupts a command that is actually running, but text typed with `pressEnter: false` and left sitting at the prompt cannot be cleared this way — PowerShell's line editor needs Ctrl+C as a real keypress, which this transport does not deliver. Close and reopen the session instead. Ctrl+Break is not supported at all: there is no ASCII control byte for it.
 
 ## Development
 
